@@ -1,11 +1,10 @@
-import dlib
+import mediapipe as mp
 import cv2
 import argparse, os, random
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import torchvision
-from torchvision import datasets, transforms
+from torchvision import transforms
+import onnxruntime as ort
 import pandas as pd
 import numpy as np
 from model import model_static
@@ -18,8 +17,9 @@ from colour import Color
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--video', type=str, help='input video path. live cam is used when not specified')
-parser.add_argument('--face', type=str, help='face detection file path. dlib face detector is used when not specified')
+parser.add_argument('--face', type=str, help='face detection file path. mediapipe face detector is used when not specified')
 parser.add_argument('--model_weight', type=str, help='path to model weights file', default='data/model_weights.pkl')
+parser.add_argument('--onnx', type=str, help='path to ONNX model (auto-exported from model_weight if missing)', default='data/model.onnx')
 parser.add_argument('--jitter', type=int, help='jitter bbox n times, and average results', default=0)
 parser.add_argument('-save_vis', help='saves output as video', action='store_true')
 parser.add_argument('-save_text', help='saves output as text', action='store_true')
@@ -27,7 +27,7 @@ parser.add_argument('-display_off', help='do not display frames', action='store_
 
 args = parser.parse_args()
 
-CNN_FACE_MODEL = 'data/mmod_human_face_detector.dat' # from http://dlib.net/files/mmod_human_face_detector.dat.bz2
+# MediaPipe face detection (replaces dlib CNN detector for ~10x CPU speedup)
 
 
 def bbox_jitter(bbox_left, bbox_top, bbox_right, bbox_bottom):
@@ -47,7 +47,23 @@ def drawrect(drawcontext, xy, outline=None, width=0):
     drawcontext.line(points, fill=outline, width=width)
 
 
-def run(video_path, face_path, model_weight, jitter, vis, display_off, save_text):
+def export_onnx(model_weight, onnx_path):
+    """Export PyTorch model to ONNX (runs once, then cached on disk)."""
+    print(f"Exporting model to ONNX: {onnx_path} ...")
+    model = model_static(model_weight)
+    model.train(False)
+    dummy = torch.zeros(1, 3, 224, 224)
+    torch.onnx.export(
+        model, dummy, onnx_path,
+        opset_version=11,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+    )
+    print("ONNX export done.")
+
+
+def run(video_path, face_path, model_weight, onnx_path, jitter, vis, display_off, save_text):
     # set up vis settings
     red = Color("red")
     colors = list(red.range_to(Color("green"),10))
@@ -55,7 +71,7 @@ def run(video_path, face_path, model_weight, jitter, vis, display_off, save_text
 
     # set up video source
     if video_path is None:
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1)
         video_path = 'live.avi'
     else:
         cap = cv2.VideoCapture(video_path)
@@ -71,7 +87,7 @@ def run(video_path, face_path, model_weight, jitter, vis, display_off, save_text
 
     # set up face detection mode
     if face_path is None:
-        facemode = 'DLIB'
+        facemode = 'MEDIAPIPE'
     else:
         facemode = 'GIVEN'
         column_names = ['frame', 'left', 'top', 'right', 'bottom']
@@ -89,23 +105,22 @@ def run(video_path, face_path, model_weight, jitter, vis, display_off, save_text
         print("Error opening video stream or file")
         exit()
 
-    if facemode == 'DLIB':
-        cnn_face_detector = dlib.cnn_face_detection_model_v1(CNN_FACE_MODEL)
+    if facemode == 'MEDIAPIPE':
+        mp_face_detection = mp.solutions.face_detection
+        face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
     frame_cnt = 0
 
     # set up data transformation
     test_transforms = transforms.Compose([transforms.Resize(224), transforms.CenterCrop(224), transforms.ToTensor(),
                                          transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 
-    # load model weights
-    model = model_static(model_weight)
-    model_dict = model.state_dict()
-    snapshot = torch.load(model_weight)
-    model_dict.update(snapshot)
-    model.load_state_dict(model_dict)
-
-    model.cuda()
-    model.train(False)
+    # load ONNX model (export from PyTorch weights on first run)
+    if not os.path.exists(onnx_path):
+        export_onnx(model_weight, onnx_path)
+    print(f"Loading ONNX model from {onnx_path} ...")
+    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    print("ONNX model ready.")
 
     # video reading loop
     while(cap.isOpened()):
@@ -116,19 +131,21 @@ def run(video_path, face_path, model_weight, jitter, vis, display_off, save_text
 
             frame_cnt += 1
             bbox = []
-            if facemode == 'DLIB':
-                dets = cnn_face_detector(frame, 1)
-                for d in dets:
-                    l = d.rect.left()
-                    r = d.rect.right()
-                    t = d.rect.top()
-                    b = d.rect.bottom()
-                    # expand a bit
-                    l -= (r-l)*0.2
-                    r += (r-l)*0.2
-                    t -= (b-t)*0.2
-                    b += (b-t)*0.2
-                    bbox.append([l,t,r,b])
+            if facemode == 'MEDIAPIPE':
+                results = face_detector.process(frame)
+                if results.detections:
+                    for detection in results.detections:
+                        rb = detection.location_data.relative_bounding_box
+                        l = rb.xmin * width
+                        t = rb.ymin * height
+                        r = l + rb.width * width
+                        b = t + rb.height * height
+                        # expand a bit (same margins as before)
+                        l -= (r-l)*0.2
+                        r += (r-l)*0.2
+                        t -= (b-t)*0.2
+                        b += (b-t)*0.2
+                        bbox.append([int(l), int(t), int(r), int(b)])
             elif facemode == 'GIVEN':
                 if frame_cnt in df.index:
                     bbox.append([df.loc[frame_cnt,'left'],df.loc[frame_cnt,'top'],df.loc[frame_cnt,'right'],df.loc[frame_cnt,'bottom']])
@@ -147,11 +164,12 @@ def run(video_path, face_path, model_weight, jitter, vis, display_off, save_text
                         img_jittered.unsqueeze_(0)
                         img = torch.cat([img, img_jittered])
 
-                # forward pass
-                output = model(img.cuda())
+                # forward pass via ONNX Runtime
+                output = session.run(None, {input_name: img.numpy()})[0]  # numpy array
+                output = torch.from_numpy(output)
                 if jitter > 0:
                     output = torch.mean(output, 0)
-                score = F.sigmoid(output).item()
+                score = torch.sigmoid(output).item()
 
                 coloridx = min(int(round(score*10)),9)
                 draw = ImageDraw.Draw(frame)
@@ -176,9 +194,11 @@ def run(video_path, face_path, model_weight, jitter, vis, display_off, save_text
         outvid.release()
     if save_text:
         f.close()
+    if key == ord('q'):
+        print ('Exiting ...')
     cap.release()
-    print 'DONE!'
+    print ('DONE!')
 
 
 if __name__ == "__main__":
-    run(args.video, args.face, args.model_weight, args.jitter, args.save_vis, args.display_off, args.save_text)
+    run(args.video, args.face, args.model_weight, args.onnx, args.jitter, args.save_vis, args.display_off, args.save_text)
