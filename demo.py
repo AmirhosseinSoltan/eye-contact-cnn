@@ -26,7 +26,7 @@ parser.add_argument('-save_text', help='saves output as text', action='store_tru
 parser.add_argument('-display_off', help='do not display frames', action='store_true')
 
 args = parser.parse_args()
-
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # MediaPipe face detection (replaces dlib CNN detector for ~10x CPU speedup)
 
 
@@ -118,7 +118,40 @@ def run(video_path, face_path, model_weight, onnx_path, jitter, vis, display_off
     if not os.path.exists(onnx_path):
         export_onnx(model_weight, onnx_path)
     print(f"Loading ONNX model from {onnx_path} ...")
-    session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+
+    # Configure ONNX Runtime session
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_options.enable_cpu_mem_arena = True
+    sess_options.enable_mem_pattern = True
+    
+    # Enable thread optimization for CPU
+    if device == 'cpu':
+        # Set intra-op threads (how many threads to use for an operation)
+        sess_options.intra_op_num_threads = min(8, os.cpu_count() or 4)
+        # Set inter-op threads (how many operations to run in parallel)
+        sess_options.inter_op_num_threads = min(8, os.cpu_count() or 4)
+    
+    # Set up providers based on device
+    if device == 'cuda' and 'CUDAExecutionProvider' in ort.get_available_providers():
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        # CUDA Provider options
+        provider_options = [
+            {
+                'device_id': 0,  # Use first GPU
+                'arena_extend_strategy': 'kNextPowerOfTwo',
+                'gpu_mem_limit': 2 * 1024 * 1024 * 1024,  # 2GB GPU Memory limit
+                'cudnn_conv_algo_search': 'EXHAUSTIVE',
+                'do_copy_in_default_stream': True,
+            },
+            {}  # CPUExecutionProvider doesn't need options
+        ]
+
+        # session = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
+        session = ort.InferenceSession(onnx_path, sess_options, providers=providers, provider_options=provider_options)
+    else:
+        session = ort.InferenceSession(onnx_path, sess_options, providers=["CPUExecutionProvider"])  
+    
     input_name = session.get_inputs()[0].name
     print("ONNX model ready.")
 
